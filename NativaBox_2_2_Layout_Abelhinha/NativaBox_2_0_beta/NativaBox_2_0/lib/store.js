@@ -6,7 +6,40 @@ export const initial=()=>({hives:Object.fromEntries([1,2,3,4].map(n=>['NATIVA-0'
 let sqlite,pool;
 const fromRow=r=>typeof r==='string'?JSON.parse(r):r;
 const newer=()=>new Date().toISOString();
+
+const isMaria=u=>/^(mysql|mariadb):\/\//i.test(u||'');
+const dt=v=>new Date(v).toISOString().slice(0,23).replace('T',' ');
+async function mariaTransaction(fn){
+ const {createPool}=await import('mysql2/promise');
+ pool??=createPool({uri:process.env.DATABASE_URL,timezone:'Z',connectionLimit:5,dateStrings:true});
+ const c=await pool.getConnection();
+ try{
+  await c.query('CREATE TABLE IF NOT EXISTS nativa_state (id INT PRIMARY KEY, data LONGTEXT NOT NULL) CHARACTER SET utf8mb4');
+  await c.query(`CREATE TABLE IF NOT EXISTS telemetry_records (
+    hive VARCHAR(32) NOT NULL, boot_id VARCHAR(64) NOT NULL, seq BIGINT NOT NULL,
+    received_at DATETIME(3) NOT NULL, record LONGTEXT NOT NULL,
+    PRIMARY KEY (hive,boot_id,seq), KEY telemetry_hive_time (hive,received_at)) CHARACTER SET utf8mb4`);
+  await c.query('INSERT IGNORE INTO nativa_state VALUES (1,?)',[JSON.stringify(initial())]);
+  await c.beginTransaction();
+  const [r]=await c.query('SELECT data FROM nativa_state WHERE id=1 FOR UPDATE');const db=JSON.parse(r[0].data);
+  if(!db.telemetryMigrated){
+   for(const [hive,h] of Object.entries(db.hives))for(const x of h.records||[])if(x.bootId&&Number.isInteger(x.packet?.seq))
+    await c.query('INSERT IGNORE INTO telemetry_records VALUES (?,?,?,?,?)',[hive,x.bootId,x.packet.seq,dt(x.receivedAt||newer()),JSON.stringify(x)]);
+   db.telemetryMigrated=true;
+  }
+  const rows=async(sql,args)=>(await c.query(sql,args))[0].map(x=>JSON.parse(x.record));
+  const ctx={
+   insert:async rec=>(await c.query('INSERT IGNORE INTO telemetry_records VALUES (?,?,?,?,?)',[rec.hive,rec.bootId,rec.packet.seq,dt(rec.receivedAt),JSON.stringify(rec)]))[0].affectedRows===1,
+   count:async hive=>Number((await c.query('SELECT count(*) AS n FROM telemetry_records WHERE hive=?',[hive]))[0][0].n),
+   history:async(hive,from,to,limit=320)=>rows(`SELECT record FROM (SELECT record,bucket,ROW_NUMBER() OVER(PARTITION BY bucket ORDER BY received_at,boot_id,seq) AS rn FROM (
+      SELECT record,received_at,boot_id,seq,NTILE(?) OVER(ORDER BY received_at,boot_id,seq) AS bucket FROM telemetry_records WHERE hive=? AND received_at>=? AND received_at<?) a) t WHERE rn=1 ORDER BY bucket`,[limit,hive,dt(from),dt(to)]),
+   page:async(hive,from,to,offset,limit)=>rows('SELECT record FROM telemetry_records WHERE hive=? AND received_at>=? AND received_at<? ORDER BY received_at,boot_id,seq LIMIT ? OFFSET ?',[hive,dt(from),dt(to),limit,offset]),
+  };
+  const result=await fn(db,ctx);await c.query('UPDATE nativa_state SET data=? WHERE id=1',[JSON.stringify(db)]);await c.commit();return result;
+ }catch(e){try{await c.rollback()}catch{}throw e;}finally{c.release()}
+}
 export async function transaction(fn){
+ if(isMaria(process.env.DATABASE_URL))return mariaTransaction(fn);
  if(process.env.DATABASE_URL){
   const {Pool}=await import('@neondatabase/serverless');pool??=new Pool({connectionString:process.env.DATABASE_URL});
   const c=await pool.connect();
